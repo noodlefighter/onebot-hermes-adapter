@@ -1,0 +1,31 @@
+name: onebot11-platform
+label: OneBot v11
+kind: platform
+version: 1.0.0
+description: >
+  OneBot v11 gateway adapter for Hermes Agent.
+  Connects to a OneBot v11 compatible server (NapCat, go-cqhttp, etc.)
+  via WebSocket and relays messages to/from the Hermes agent.
+author: Hermes
+requires_env:
+  - name: ONEBOT11_WS_URL
+    description: "WebSocket server URL (e.g. ws://localhost:6098/ws)"
+    prompt: "OneBot11 WebSocket URL"
+    password: false
+optional_env:
+  - name: ONEBOT11_ACCESS_TOKEN
+    description: "Access token for authentication (optional)"
+    prompt: "Access token (optional)"
+    password: true
+  - name: ONEBOT11_ALLOWED_USERS
+    description: "Comma-separated user IDs allowed to talk to the bot (empty = all)"
+    prompt: "Allowed user IDs (comma-separated)"
+    password: false
+  - name: ONEBOT11_ALLOW_ALL_USERS
+    description: "Allow all users to talk to the bot (dev only)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: ONEBOT11_HOME_CHANNEL
+    description: "Group/user ID for cron/notification delivery"
+    prompt: "Home channel (or empty)"
+    password: false
