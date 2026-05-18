@@ -42,6 +42,7 @@ from gateway.platforms.base import (
     SendResult,
     MessageEvent,
     MessageType,
+    cache_image_from_bytes,
 )
 from gateway.session import SessionSource
 from gateway.config import PlatformConfig, Platform
@@ -80,6 +81,35 @@ def _is_at_bot(segments: list, bot_id: str) -> bool:
 def _build_text_message(text: str) -> list:
     """Build OneBot v11 message segments from plain text."""
     return [{"type": "text", "data": {"text": text}}]
+def _extract_images(segments: list) -> list:
+    """Extract image URLs/data from OneBot v11 message segments.
+
+    Returns list of dicts with 'url' and optionally 'data' (base64).
+    NapCat image segments can have:
+      - data.file: local file path or URL
+      - data.url: direct URL
+      - data.file_base64: base64 encoded image data
+    """
+    images = []
+    for seg in segments:
+        if seg.get("type") == "image":
+            data = seg.get("data", {})
+            img_info = {}
+            # Prefer url, then file (if it looks like a URL)
+            url = data.get("url") or ""
+            file_val = data.get("file") or ""
+            if url:
+                img_info["url"] = url
+            elif file_val and (file_val.startswith("http://") or file_val.startswith("https://")):
+                img_info["url"] = file_val
+            elif file_val and file_val.startswith("file://"):
+                img_info["url"] = file_val
+            elif file_val:
+                # Could be a local path or base64
+                img_info["url"] = file_val
+            if img_info:
+                images.append(img_info)
+    return images
 
 
 def _build_image_message(file: str) -> list:
@@ -251,8 +281,10 @@ class OneBot11Adapter(BasePlatformAdapter):
             return
 
         # Extract text content
+        images = []
         if isinstance(message, list):
             text = _extract_text(message)
+            images = _extract_images(message)
             # Check if bot is mentioned in group
             is_mention = _is_at_bot(message, self._bot_id) if self._bot_id else False
         elif isinstance(message, str):
@@ -262,7 +294,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             text = str(raw_message)
             is_mention = False
 
-        if not text:
+        if not text and not images:
             return
 
         # Build session key
@@ -283,6 +315,51 @@ class OneBot11Adapter(BasePlatformAdapter):
             source=source,
             message_id=message_id,
         )
+
+        # Process images - download and cache locally for vision tool
+        if images:
+            media_urls = []
+            media_types = []
+            for img in images:
+                url = img.get("url", "")
+                if not url:
+                    continue
+                try:
+                    if url.startswith("file://"):
+                        # Local file - use directly
+                        local_path = url[7:]
+                        if os.path.exists(local_path):
+                            media_urls.append(local_path)
+                            ext = os.path.splitext(local_path)[1].lower() or ".jpg"
+                            media_types.append(f"image/{ext.lstrip('.')}")
+                    elif url.startswith("http://") or url.startswith("https://"):
+                        # Remote URL - download and cache using stdlib
+                        import urllib.request
+                        def _download_image():
+                            req = urllib.request.Request(url, headers={"User-Agent": "HermesBot/1.0"})
+                            with urllib.request.urlopen(req, timeout=30) as resp:
+                                return resp.read(), resp.headers.get("Content-Type", "")
+                        img_bytes, ct = await asyncio.to_thread(_download_image)
+                        ext = ".jpg"
+                        if "png" in ct:
+                            ext = ".png"
+                        elif "webp" in ct:
+                            ext = ".webp"
+                        elif "gif" in ct:
+                            ext = ".gif"
+                        cached = cache_image_from_bytes(img_bytes, ext)
+                        media_urls.append(cached)
+                        media_types.append(f"image/{ext.lstrip('.')}")
+                        logger.info("OneBot v11: cached image from URL: %s", url[:80])
+                    else:
+                        # Could be base64 or other format - skip for now
+                        logger.debug("OneBot v11: skipping non-URL image: %s", url[:50])
+                except Exception as e:
+                    logger.warning("OneBot v11: failed to process image: %s", e)
+
+            if media_urls:
+                event.media_urls = media_urls
+                event.media_types = media_types
 
         # Store OneBot-specific metadata for send operations
         event._onebot_chat_type = chat_type
