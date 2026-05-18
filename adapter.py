@@ -157,6 +157,8 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._recv_task: Optional[asyncio.Task] = None
         self._bot_id: Optional[str] = None
         self._connected = False
+        # Pending API call futures, keyed by echo value
+        self._pending_api_calls: Dict[str, asyncio.Future] = {}
 
     @property
     def name(self) -> str:
@@ -234,6 +236,13 @@ class OneBot11Adapter(BasePlatformAdapter):
             async for raw_msg in self._ws:
                 try:
                     data = json.loads(raw_msg)
+                    # Check if this is a response to a pending API call
+                    echo = data.get("echo")
+                    if echo and echo in self._pending_api_calls:
+                        fut = self._pending_api_calls.pop(echo)
+                        if not fut.done():
+                            fut.set_result(data)
+                        continue
                     await self._handle_event(data)
                 except json.JSONDecodeError:
                     logger.warning("OneBot v11: received non-JSON message")
@@ -396,9 +405,15 @@ class OneBot11Adapter(BasePlatformAdapter):
         segments = _build_text_message(content)
 
         # Determine send action based on available info
-        # For private chats, chat_id IS the user_id
-        # For group chats, metadata should contain group_id
-        group_id = metadata.get("group_id")
+        # Supports "group:XXXXX" prefix convention for proactive push
+        group_id = None
+        effective_chat_id = chat_id
+
+        if chat_id and chat_id.startswith("group:"):
+            group_id = chat_id[6:]  # strip "group:" prefix
+            effective_chat_id = group_id
+        elif metadata and metadata.get("group_id"):
+            group_id = metadata["group_id"]
 
         if group_id:
             action = "send_group_msg"
@@ -448,14 +463,17 @@ class OneBot11Adapter(BasePlatformAdapter):
         if caption:
             segments.extend(_build_text_message(caption))
 
-        # Determine send action
-        group_id = metadata.get("group_id")
+        # Determine send action — supports "group:XXXXX" prefix
+        group_id = None
+        if chat_id and chat_id.startswith("group:"):
+            group_id = chat_id[6:]
+        elif metadata and metadata.get("group_id"):
+            group_id = metadata["group_id"]
 
         if group_id:
             action = "send_group_msg"
             params = {"group_id": int(group_id), "message": segments}
         else:
-            # Default to private message - chat_id is the user_id
             action = "send_private_msg"
             params = {"user_id": int(chat_id), "message": segments}
 
@@ -482,11 +500,69 @@ class OneBot11Adapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get chat information."""
+        # Try to resolve group name from cached group list
+        if chat_id.startswith("group:"):
+            gid = chat_id[6:]
+            groups = await self.get_group_list()
+            for g in groups:
+                if str(g.get("group_id")) == gid:
+                    return {"name": g.get("group_name", gid), "type": "group", "chat_id": chat_id}
         return {
             "name": f"OneBot v11 chat {chat_id}",
             "type": "group",
             "chat_id": chat_id,
         }
+
+    # ── OneBot11 API helpers ─────────────────────────────────────────────
+
+    async def _call_api(self, action: str, params: Optional[Dict] = None) -> Optional[Dict]:
+        """Call a OneBot11 API action and return the response data.
+
+        Sends the request over the existing WebSocket connection and waits
+        for the matching echo response via the receive loop's dispatch.
+        Returns the ``data`` field on success, or ``None`` on failure.
+        """
+        if not self._ws or not self._connected:
+            logger.error("OneBot v11 _call_api: not connected")
+            return None
+
+        echo = str(uuid.uuid4())
+        request = {"action": action, "params": params or {}, "echo": echo}
+
+        # Register a future before sending to avoid race condition
+        loop = asyncio.get_event_loop()
+        fut = loop.create_future()
+        self._pending_api_calls[echo] = fut
+
+        try:
+            await self._ws.send(json.dumps(request))
+        except Exception as e:
+            self._pending_api_calls.pop(echo, None)
+            logger.error("OneBot v11 _call_api send failed: %s", e)
+            return None
+
+        try:
+            data = await asyncio.wait_for(fut, timeout=10)
+        except asyncio.TimeoutError:
+            self._pending_api_calls.pop(echo, None)
+            logger.warning("OneBot v11 _call_api: timeout waiting for %s response", action)
+            return None
+
+        if data.get("status") == "ok":
+            return data.get("data")
+        logger.warning("OneBot v11 _call_api %s error: %s", action, data.get("wording"))
+        return None
+
+    async def get_group_list(self) -> List[Dict[str, Any]]:
+        """Return all groups the bot is in.
+
+        Each entry contains at least ``group_id`` and ``group_name``.
+        Result is fetched from NapCat on demand (not cached).
+        """
+        data = await self._call_api("get_group_list")
+        if data is None:
+            return []
+        return data if isinstance(data, list) else []
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +572,71 @@ class OneBot11Adapter(BasePlatformAdapter):
 def _check_requirements() -> bool:
     """Check if websockets is installed."""
     return WEBSOCKETS_AVAILABLE
+
+
+async def _standalone_send(
+    pconfig,
+    chat_id: str,
+    message: str,
+    *,
+    thread_id: Optional[str] = None,
+    media_files: Optional[List[str]] = None,
+    force_document: bool = False,
+) -> Dict[str, Any]:
+    """Open an ephemeral WebSocket to NapCat, send, and close.
+
+    Used by ``tools/send_message_tool._send_via_adapter`` when the gateway
+    runner is not in this process (e.g. ``hermes cron`` running separately).
+    """
+    try:
+        import websockets as _wsclient
+    except ImportError:
+        return {"error": "websockets not installed. Run: pip install websockets"}
+
+    extra = getattr(pconfig, "extra", {}) or {}
+    ws_url = os.getenv("ONEBOT11_WS_URL") or extra.get("ws_url", "")
+    token = os.getenv("ONEBOT11_ACCESS_TOKEN") or extra.get("access_token", "")
+    if not ws_url:
+        return {"error": "OneBot11 standalone send: ONEBOT11_WS_URL is required"}
+
+    try:
+        headers = {}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        # Parse chat_id — supports "group:XXXXX" prefix
+        if chat_id.startswith("group:"):
+            group_id = int(chat_id[6:])
+            action = "send_group_msg"
+            params = {"group_id": group_id, "message": _build_text_message(message)}
+        else:
+            action = "send_private_msg"
+            params = {"user_id": int(chat_id), "message": _build_text_message(message)}
+
+        request = {
+            "action": action,
+            "params": params,
+            "echo": str(uuid.uuid4()),
+        }
+
+        connect_kwargs = {"open_timeout": 10, "close_timeout": 5}
+        if headers:
+            connect_kwargs["additional_headers"] = headers
+
+        async with _wsclient.connect(ws_url, **connect_kwargs) as ws:
+            await ws.send(json.dumps(request))
+            # Wait for response (skip lifecycle/meta events)
+            for _ in range(20):
+                resp = await asyncio.wait_for(ws.recv(), timeout=10)
+                data = json.loads(resp)
+                if data.get("echo") == request["echo"]:
+                    if data.get("status") == "ok":
+                        return {"success": True, "message_id": str(data.get("data", {}).get("message_id", ""))}
+                    return {"error": f"OneBot11 API error: {data.get('wording', data)}"}
+            return {"error": "OneBot11 standalone send: no response received"}
+
+    except Exception as e:
+        return {"error": f"OneBot11 standalone send failed: {e}"}
 
 
 def register(ctx) -> None:
@@ -515,4 +656,5 @@ def register(ctx) -> None:
         allow_all_env="ONEBOT11_ALLOW_ALL_USERS",
         emoji="🐧",
         cron_deliver_env_var="ONEBOT11_HOME_CHANNEL",
+        standalone_sender_fn=_standalone_send,
     )
