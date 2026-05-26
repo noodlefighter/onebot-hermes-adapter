@@ -152,6 +152,13 @@ class OneBot11Adapter(BasePlatformAdapter):
             else extra.get("allow_all_users", False)
         )
 
+        # Group chat whitelist — only process messages from allowed groups.
+        # Empty/missing = deny all group messages (whitelist-not-configured = reject all).
+        self._group_allowed_chats: set = set()
+        group_allowed = extra.get("group_allowed_chats", [])
+        if group_allowed:
+            self._group_allowed_chats = {str(g) for g in group_allowed}
+
         # Runtime state
         self._ws: Any = None
         self._recv_task: Optional[asyncio.Task] = None
@@ -283,6 +290,12 @@ class OneBot11Adapter(BasePlatformAdapter):
         if message_type == "group":
             chat_id = str(group_id)
             chat_type = "group"
+            # Group whitelist filter: deny all if list is empty, else allow only listed groups
+            if chat_id not in self._group_allowed_chats:
+                logger.info(
+                    "OneBot v11: ignoring message from non-allowed group %s", chat_id
+                )
+                return
         elif message_type == "private":
             chat_id = user_id
             chat_type = "dm"
