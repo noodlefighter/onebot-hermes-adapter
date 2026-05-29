@@ -38,6 +38,8 @@
 - 支持私聊和群聊消息收发
 - 支持图片发送
 - 用户白名单 / 全放行权限控制
+- 群白名单过滤（`group_allowed_chats`）
+- 群内仅响应 @ 机器人消息（`at_mention_only`）
 - Cron 定时任务投递支持
 
 ## 安装
@@ -56,10 +58,23 @@ pip install websockets
 
 ### 安装插件
 
-将以下文件复制到 Hermes Agent 的插件目录：
+将本仓库克隆到 `~/.hermes/plugins/` 目录下（非入侵式，不会被 `hermes update` 覆盖）：
 
 ```bash
-cp adapter.py __init__.py plugin.yaml ~/.hermes/hermes-agent/plugins/platforms/onebot11/
+cd ~/.hermes/plugins
+git clone https://github.com/noodlefighter/onebot-hermes-adapter.git
+```
+
+### 启用插件
+
+```bash
+hermes plugins enable onebot11-platform
+```
+
+启用后重启 gateway 生效：
+
+```bash
+hermes gateway restart
 ```
 
 ## 配置
@@ -172,7 +187,7 @@ hermes gateway
 ## 文件结构
 
 ```
-onebot-hermes-adapter/
+~/.hermes/plugins/onebot-hermes-adapter/
 ├── README.md
 ├── plugin.yaml      # 插件元数据
 ├── __init__.py      # 入口文件
