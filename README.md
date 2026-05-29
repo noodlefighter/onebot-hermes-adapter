@@ -88,6 +88,9 @@ platforms:
       access_token: "your-token"
       allowed_users:
         - "123456789"
+      group_allowed_chats:
+        - "540827889"
+      at_mention_only: true
       allow_all_users: false
 ```
 
@@ -100,6 +103,22 @@ platforms:
 | `ONEBOT11_ALLOWED_USERS` | `allowed_users` | 允许使用 bot 的用户 ID 列表（逗号分隔） |
 | `ONEBOT11_ALLOW_ALL_USERS` | `allow_all_users` | 是否允许所有用户（true/false） |
 | `ONEBOT11_HOME_CHANNEL` | - | Cron 任务投递的默认频道 ID |
+| `ONEBOT11_GROUP_ALLOWED_CHATS` | `group_allowed_chats` | 允许进入 gateway 的群号列表（逗号分隔 / YAML 列表） |
+| `ONEBOT11_AT_MENTION_ONLY` | `at_mention_only` | 群内是否仅处理 @ 机器人的消息 |
+
+### 群消息过滤顺序
+
+1. 先检查 `group_allowed_chats`
+   - 未配置时，默认拒绝所有群消息
+   - 只有白名单群会继续进入 gateway
+2. 如果开启 `at_mention_only: true`，再检查是否 @ 机器人
+3. 最后由 gateway 按 `allowed_users` / `allow_all_users` 检查发送者是否授权
+
+这意味着：
+
+- 白名单外的群消息不会进入 gateway，也不会进入 session
+- 白名单群里未 @ 机器人的消息也不会进入 gateway
+- 发送功能不受上述过滤影响，仍可正常向群里回消息
 
 ## OneBot 服务器配置
 

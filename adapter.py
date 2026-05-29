@@ -78,9 +78,32 @@ def _is_at_bot(segments: list, bot_id: str) -> bool:
     return False
 
 
+def _parse_csv_list(value: Any) -> list:
+    """Parse a config value into a list of strings."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def _parse_bool(value: Any, default: bool = False) -> bool:
+    """Parse a loose bool value from config or environment."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _build_text_message(text: str) -> list:
     """Build OneBot v11 message segments from plain text."""
     return [{"type": "text", "data": {"text": text}}]
+
 def _extract_images(segments: list) -> list:
     """Extract image URLs/data from OneBot v11 message segments.
 
@@ -141,23 +164,29 @@ class OneBot11Adapter(BasePlatformAdapter):
         # Auth
         self.allowed_users: list = extra.get("allowed_users", [])
         if os.getenv("ONEBOT11_ALLOWED_USERS"):
-            self.allowed_users = [
-                u.strip() for u in os.getenv("ONEBOT11_ALLOWED_USERS").split(",") if u.strip()
-            ]
+            self.allowed_users = _parse_csv_list(os.getenv("ONEBOT11_ALLOWED_USERS"))
         self._allowed_users_set: set = {str(u) for u in self.allowed_users}
 
         self.allow_all_users = (
-            os.getenv("ONEBOT11_ALLOW_ALL_USERS", "").lower() in ("1", "true", "yes")
+            _parse_bool(os.getenv("ONEBOT11_ALLOW_ALL_USERS"), default=False)
             if os.getenv("ONEBOT11_ALLOW_ALL_USERS")
             else extra.get("allow_all_users", False)
         )
 
         # Group chat whitelist — only process messages from allowed groups.
-        # Empty/missing = deny all group messages (whitelist-not-configured = reject all).
+        # Empty/missing = deny all group messages.
         self._group_allowed_chats: set = set()
         group_allowed = extra.get("group_allowed_chats", [])
         if group_allowed:
-            self._group_allowed_chats = {str(g) for g in group_allowed}
+            self._group_allowed_chats = {str(g) for g in _parse_csv_list(group_allowed)}
+        if os.getenv("ONEBOT11_GROUP_ALLOWED_CHATS"):
+            self._group_allowed_chats = set(_parse_csv_list(os.getenv("ONEBOT11_GROUP_ALLOWED_CHATS")))
+
+        self.at_mention_only = (
+            _parse_bool(os.getenv("ONEBOT11_AT_MENTION_ONLY"), default=False)
+            if os.getenv("ONEBOT11_AT_MENTION_ONLY")
+            else extra.get("at_mention_only", False)
+        )
 
         # Runtime state
         self._ws: Any = None
@@ -166,6 +195,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._connected = False
         # Pending API call futures, keyed by echo value
         self._pending_api_calls: Dict[str, asyncio.Future] = {}
+        self._chat_type_cache: Dict[str, str] = {}
 
     @property
     def name(self) -> str:
@@ -302,6 +332,15 @@ class OneBot11Adapter(BasePlatformAdapter):
         else:
             return
 
+        if chat_type == "group":
+            if not self._group_allowed_chats or chat_id not in self._group_allowed_chats:
+                logger.info("OneBot v11: ignoring message from non-allowed group %s", chat_id)
+                return
+
+        # Cache the last known chat type for this chat_id so send() can route
+        # messages correctly even when gateway only passes a raw numeric ID.
+        self._chat_type_cache[chat_id] = chat_type
+
         # Extract text content
         images = []
         if isinstance(message, list):
@@ -315,6 +354,10 @@ class OneBot11Adapter(BasePlatformAdapter):
         else:
             text = str(raw_message)
             is_mention = False
+
+        if chat_type == "group" and self.at_mention_only and not is_mention:
+            logger.info("OneBot v11: ignoring non-mention group message %s", chat_id)
+            return
 
         if not text and not images:
             return
@@ -418,19 +461,20 @@ class OneBot11Adapter(BasePlatformAdapter):
         segments = _build_text_message(content)
 
         # Determine send action based on available info
-        # Supports "group:XXXXX" prefix convention for proactive push
+        # Supports "group:XXXXX" prefix convention for proactive push.
+        # Also falls back to cached chat_type because gateway may pass a raw
+        # numeric chat_id for group replies.
         group_id = None
-        effective_chat_id = chat_id
-
         if chat_id and chat_id.startswith("group:"):
             group_id = chat_id[6:]  # strip "group:" prefix
-            effective_chat_id = group_id
         elif metadata and metadata.get("group_id"):
             group_id = metadata["group_id"]
 
-        if group_id:
+        chat_type = metadata.get("chat_type") or self._chat_type_cache.get(str(chat_id))
+
+        if group_id or chat_type == "group":
             action = "send_group_msg"
-            params = {"group_id": int(group_id), "message": segments}
+            params = {"group_id": int(group_id or chat_id), "message": segments}
         else:
             # Default to private message - chat_id is the user_id
             action = "send_private_msg"
@@ -476,16 +520,18 @@ class OneBot11Adapter(BasePlatformAdapter):
         if caption:
             segments.extend(_build_text_message(caption))
 
-        # Determine send action — supports "group:XXXXX" prefix
+        # Determine send action — supports "group:XXXXX" prefix and cached chat type.
         group_id = None
         if chat_id and chat_id.startswith("group:"):
             group_id = chat_id[6:]
         elif metadata and metadata.get("group_id"):
             group_id = metadata["group_id"]
 
-        if group_id:
+        chat_type = metadata.get("chat_type") or self._chat_type_cache.get(str(chat_id))
+
+        if group_id or chat_type == "group":
             action = "send_group_msg"
-            params = {"group_id": int(group_id), "message": segments}
+            params = {"group_id": int(group_id or chat_id), "message": segments}
         else:
             action = "send_private_msg"
             params = {"user_id": int(chat_id), "message": segments}
