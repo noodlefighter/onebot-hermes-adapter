@@ -52,8 +52,16 @@
 
 ### 安装依赖
 
+**必须安装到 Hermes 的 venv 环境中**，否则插件加载时找不到依赖：
+
 ```bash
-pip install websockets
+~/.hermes/hermes-agent/venv/bin/pip install websockets
+```
+
+验证安装成功：
+
+```bash
+~/.hermes/hermes-agent/venv/bin/python -c "import websockets; print(websockets.__version__)"
 ```
 
 ### 安装插件
