@@ -16,10 +16,11 @@ Configuration in config.yaml::
             access_token: ""
             allowed_users: []
             allow_all_users: false
+            allow_all_in_group: false
 
 Or via environment variables (overrides config.yaml):
     ONEBOT11_WS_URL, ONEBOT11_ACCESS_TOKEN, ONEBOT11_ALLOWED_USERS,
-    ONEBOT11_ALLOW_ALL_USERS
+    ONEBOT11_ALLOW_ALL_USERS, ONEBOT11_ALLOW_ALL_IN_GROUP
 """
 
 import asyncio
@@ -186,6 +187,14 @@ class OneBot11Adapter(BasePlatformAdapter):
             _parse_bool(os.getenv("ONEBOT11_AT_MENTION_ONLY"), default=False)
             if os.getenv("ONEBOT11_AT_MENTION_ONLY")
             else extra.get("at_mention_only", False)
+        )
+
+        # Group open auth — skip per-user authorization for group chats.
+        # DMs still require pairing / allowed_users.
+        self.allow_all_in_group = (
+            _parse_bool(os.getenv("ONEBOT11_ALLOW_ALL_IN_GROUP"), default=False)
+            if os.getenv("ONEBOT11_ALLOW_ALL_IN_GROUP")
+            else extra.get("allow_all_in_group", False)
         )
 
         # Runtime state
@@ -430,6 +439,12 @@ class OneBot11Adapter(BasePlatformAdapter):
         event._onebot_chat_type = chat_type
         event._onebot_group_id = str(group_id) if group_id else None
         event._onebot_user_id = user_id
+
+        # allow_all_in_group: mark group messages as internal so the gateway
+        # skips _is_user_authorized().  DMs are never marked — they still
+        # require pairing / allowed_users.
+        if self.allow_all_in_group and chat_type == "group":
+            event.internal = True
 
         # Dispatch to handler using base class method
         # This ensures proper session management, typing indicators, etc.
