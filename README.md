@@ -40,6 +40,7 @@
 - 用户白名单 / 全放行权限控制
 - 群白名单过滤（`group_allowed_chats`）
 - 群内仅响应 @ 机器人消息（`at_mention_only`）
+- 未授权私聊静默忽略（`silent_unauthorized_dm`）
 - Cron 定时任务投递支持
 
 ## 安装
@@ -115,6 +116,7 @@ platforms:
         - "540827889"
       at_mention_only: true
       allow_all_users: false
+      silent_unauthorized_dm: true
 ```
 
 ### 配置说明
@@ -128,6 +130,7 @@ platforms:
 | `ONEBOT11_HOME_CHANNEL` | - | Cron 任务投递的默认频道 ID |
 | `ONEBOT11_GROUP_ALLOWED_CHATS` | `group_allowed_chats` | 允许进入 gateway 的群号列表（逗号分隔 / YAML 列表） |
 | `ONEBOT11_AT_MENTION_ONLY` | `at_mention_only` | 群内是否仅处理 @ 机器人的消息 |
+| `ONEBOT11_SILENT_UNAUTHORIZED_DM` | `silent_unauthorized_dm` | 是否静默忽略未授权用户的私聊（不触发配对流程） |
 
 ### 群消息过滤顺序
 
@@ -191,6 +194,7 @@ hermes gateway
 
 - **白名单模式**：设置 `ONEBOT11_ALLOWED_USERS` 后，只有指定用户 ID 可以与 bot 对话
 - **全放行模式**：设置 `ONEBOT11_ALLOW_ALL_USERS=true` 后，所有人都可以与 bot 对话
+- **静默未授权私聊**：设置 `silent_unauthorized_dm: true` 后，未授权用户的私聊消息被静默丢弃，不触发配对码提示
 
 ## 文件结构
 

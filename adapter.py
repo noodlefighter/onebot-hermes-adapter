@@ -17,10 +17,12 @@ Configuration in config.yaml::
             allowed_users: []
             allow_all_users: false
             allow_all_in_group: false
+            silent_unauthorized_dm: false
 
 Or via environment variables (overrides config.yaml):
     ONEBOT11_WS_URL, ONEBOT11_ACCESS_TOKEN, ONEBOT11_ALLOWED_USERS,
-    ONEBOT11_ALLOW_ALL_USERS, ONEBOT11_ALLOW_ALL_IN_GROUP
+    ONEBOT11_ALLOW_ALL_USERS, ONEBOT11_ALLOW_ALL_IN_GROUP,
+    ONEBOT11_SILENT_UNAUTHORIZED_DM
 """
 
 import asyncio
@@ -197,6 +199,15 @@ class OneBot11Adapter(BasePlatformAdapter):
             else extra.get("allow_all_in_group", False)
         )
 
+        # Silent unauthorized DM — when enabled, DMs from users not in
+        # allowed_users are silently dropped instead of being forwarded to
+        # the gateway (which would trigger the pairing code message).
+        self.silent_unauthorized_dm = (
+            _parse_bool(os.getenv("ONEBOT11_SILENT_UNAUTHORIZED_DM"), default=False)
+            if os.getenv("ONEBOT11_SILENT_UNAUTHORIZED_DM")
+            else extra.get("silent_unauthorized_dm", False)
+        )
+
         # Runtime state
         self._ws: Any = None
         self._recv_task: Optional[asyncio.Task] = None
@@ -345,6 +356,19 @@ class OneBot11Adapter(BasePlatformAdapter):
             if not self._group_allowed_chats or chat_id not in self._group_allowed_chats:
                 logger.info("OneBot v11: ignoring message from non-allowed group %s", chat_id)
                 return
+
+        # Silent unauthorized DM — drop DMs from users not in allowed_users
+        # instead of forwarding to gateway (which would trigger pairing).
+        if (
+            self.silent_unauthorized_dm
+            and chat_type == "dm"
+            and not self.allow_all_users
+            and user_id not in self._allowed_users_set
+        ):
+            logger.info(
+                "OneBot v11: silently ignoring unauthorized DM from %s", user_id
+            )
+            return
 
         # Cache the last known chat type for this chat_id so send() can route
         # messages correctly even when gateway only passes a raw numeric ID.
