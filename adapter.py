@@ -26,13 +26,13 @@ Or via environment variables (overrides config.yaml):
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
-import time
 import uuid
-from datetime import datetime
 from typing import Any, Dict, List, Optional
+from urllib.parse import unquote as _unquote
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,6 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
     MessageEvent,
-    MessageType,
     cache_image_from_bytes,
 )
 from gateway.session import SessionSource
@@ -141,6 +140,55 @@ def _extract_images(segments: list) -> list:
 def _build_image_message(file: str) -> list:
     """Build OneBot v11 image message segment."""
     return [{"type": "image", "data": {"file": file}}]
+
+
+def _resolve_image_source(image_url: str) -> str:
+    """Resolve an image URL/path to a OneBot-compatible source string.
+
+    Handles:
+    - HTTP/HTTPS URLs → pass through
+    - file:// URIs → convert to RFC 8089 file URI
+    - Local file paths → read and convert to base64://
+    - Base64 data URIs → convert to base64://
+    """
+    if not image_url:
+        return image_url
+
+    # HTTP/HTTPS — pass through directly
+    if image_url.startswith("http://") or image_url.startswith("https://"):
+        return image_url
+
+    # file:// URI — decode and check local path
+    if image_url.startswith("file://"):
+        local_path = _unquote(image_url[7:])
+        if os.path.exists(local_path):
+            return _file_to_base64(local_path)
+        # If file doesn't exist, return as-is (might be a remote-style file URI)
+        return image_url
+
+    # Base64 data URI — convert to base64:// protocol
+    if image_url.startswith("data:") and ";base64," in image_url:
+        raw = image_url.split(";base64,", 1)[1]
+        return f"base64://{raw}"
+
+    # Bare base64:// prefix — pass through
+    if image_url.startswith("base64://"):
+        return image_url
+
+    # Assume local file path
+    if os.path.exists(image_url):
+        return _file_to_base64(image_url)
+
+    # Unknown format — return as-is, let OneBot handle it
+    return image_url
+
+
+def _file_to_base64(file_path: str) -> str:
+    """Read a local file and return a base64:// string for OneBot."""
+    with open(file_path, "rb") as f:
+        data = f.read()
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"base64://{encoded}"
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +389,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             chat_id = str(group_id)
             chat_type = "group"
             # Group whitelist filter: deny all if list is empty, else allow only listed groups
-            if chat_id not in self._group_allowed_chats:
+            if not self._group_allowed_chats or chat_id not in self._group_allowed_chats:
                 logger.info(
                     "OneBot v11: ignoring message from non-allowed group %s", chat_id
                 )
@@ -351,11 +399,6 @@ class OneBot11Adapter(BasePlatformAdapter):
             chat_type = "dm"
         else:
             return
-
-        if chat_type == "group":
-            if not self._group_allowed_chats or chat_id not in self._group_allowed_chats:
-                logger.info("OneBot v11: ignoring message from non-allowed group %s", chat_id)
-                return
 
         # Silent unauthorized DM — drop DMs from users not in allowed_users
         # instead of forwarding to gateway (which would trigger pairing).
@@ -488,7 +531,6 @@ class OneBot11Adapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a text message via OneBot v11."""
-        print(f"ONEBOT11 SEND CALLED: chat_id={chat_id}, content={content[:50]}", flush=True)
         logger.info("OneBot v11: send called, chat_id=%s, content=%s", chat_id, content[:50])
         if not self._ws or not self._connected:
             logger.error("OneBot v11: send failed - not connected")
@@ -548,14 +590,21 @@ class OneBot11Adapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send an image via OneBot v11."""
+        """Send an image via OneBot v11.
+
+        Supports HTTP URLs, file:// URIs, local paths, and base64 data.
+        Local files are read and sent as base64:// segments.
+        """
         if not self._ws or not self._connected:
             return SendResult(success=False, error="Not connected")
 
         metadata = metadata or {}
 
+        # Resolve the image source to a OneBot-compatible format
+        resolved = _resolve_image_source(image_url)
+
         # Build message segments
-        segments = _build_image_message(image_url)
+        segments = _build_image_message(resolved)
         if caption:
             segments.extend(_build_text_message(caption))
 
@@ -587,6 +636,37 @@ class OneBot11Adapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("OneBot v11: send_image failed: %s", e)
             return SendResult(success=False, error=str(e))
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a local image file via OneBot v11.
+
+        Reads the file and sends it as base64-encoded image segment.
+        """
+        if not os.path.exists(image_path):
+            return SendResult(success=False, error=f"File not found: {image_path}")
+
+        try:
+            resolved = _file_to_base64(image_path)
+        except Exception as e:
+            logger.error("OneBot v11: failed to read image file %s: %s", image_path, e)
+            return SendResult(success=False, error=str(e))
+
+        # Delegate to send_image with the resolved base64 source
+        return await self.send_image(
+            chat_id=chat_id,
+            image_url=resolved,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """OneBot v11 doesn't have a native typing indicator, so this is a no-op."""
@@ -702,14 +782,39 @@ async def _standalone_send(
         if token:
             headers["Authorization"] = f"Bearer {token}"
 
+        # Build message segments — text + optional images
+        segments = []
+        if message:
+            segments.extend(_build_text_message(message))
+
+        if media_files:
+            for media_path in media_files:
+                # Strip file:// prefix if present
+                local_path = media_path
+                if media_path.startswith("file://"):
+                    local_path = _unquote(media_path[7:])
+                if os.path.exists(local_path):
+                    try:
+                        resolved = _file_to_base64(local_path)
+                        segments.extend(_build_image_message(resolved))
+                    except Exception as e:
+                        logger.warning("OneBot11 standalone: failed to read image %s: %s", local_path, e)
+                elif media_path.startswith("http://") or media_path.startswith("https://"):
+                    segments.extend(_build_image_message(media_path))
+                else:
+                    logger.warning("OneBot11 standalone: media file not found: %s", media_path)
+
+        if not segments:
+            return {"error": "No message content to send"}
+
         # Parse chat_id — supports "group:XXXXX" prefix
         if chat_id.startswith("group:"):
             group_id = int(chat_id[6:])
             action = "send_group_msg"
-            params = {"group_id": group_id, "message": _build_text_message(message)}
+            params = {"group_id": group_id, "message": segments}
         else:
             action = "send_private_msg"
-            params = {"user_id": int(chat_id), "message": _build_text_message(message)}
+            params = {"user_id": int(chat_id), "message": segments}
 
         request = {
             "action": action,

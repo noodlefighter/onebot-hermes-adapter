@@ -36,12 +36,36 @@
 
 - 通过 WebSocket 连接 OneBot v11 服务器
 - 支持私聊和群聊消息收发
-- 支持图片发送
+- 支持图片发送（HTTP URL、本地文件、base64 编码）
 - 用户白名单 / 全放行权限控制
 - 群白名单过滤（`group_allowed_chats`）
 - 群内仅响应 @ 机器人消息（`at_mention_only`）
 - 未授权私聊静默忽略（`silent_unauthorized_dm`）
-- Cron 定时任务投递支持
+- Cron 定时任务投递支持（含图片附件）
+
+### 图片发送支持
+
+适配器实现了完整的图片发送能力，遵循 OneBot v11 协议的 `image` 消息段规范。
+
+**支持的图片来源：**
+
+| 来源 | 格式 | 说明 |
+|------|------|------|
+| HTTP/HTTPS URL | `http://example.com/photo.jpg` | 框架自动下载并上传 |
+| 本地文件路径 | `/path/to/image.png` | 自动读取并转为 base64 编码 |
+| `file://` URI | `file:///path/to/image.png` | RFC 8089 格式，自动解码 |
+| Base64 data URI | `data:image/png;base64,...` | 自动转换为 `base64://` 协议 |
+| `base64://` | `base64://iVBORw0KGgo...` | 直接传递给 OneBot |
+
+**关键实现：**
+
+- `send_image()` — 发送图片，自动解析各种来源格式
+- `send_image_file()` — 发送本地图片文件（Gateway 媒体投递路径）
+- `_standalone_send()` — 支持 `media_files` 参数（Cron 独立进程发送）
+
+**工作原理：**
+
+由于 OneBot v11 服务器（如 NapCat）通常运行在 Docker 容器中，无法直接访问宿主机本地文件路径。适配器会将本地文件读取后编码为 `base64://` 格式，嵌入到 OneBot 的 `image` 消息段中发送，确保容器内外文件系统隔离不影响图片投递。
 
 ## 安装
 
