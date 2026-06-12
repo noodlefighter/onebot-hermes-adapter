@@ -256,6 +256,13 @@ class OneBot11Adapter(BasePlatformAdapter):
             else extra.get("silent_unauthorized_dm", False)
         )
 
+        # Connect notify — send a message to these chat_ids when connected.
+        # Accepts a list in config.yaml or a comma-separated string in env var.
+        self._connect_notify_chat_ids: list = _parse_csv_list(
+            os.getenv("ONEBOT11_CONNECT_NOTIFY")
+            or extra.get("connect_notify", [])
+        )
+
         # Runtime state
         self._ws: Any = None
         self._recv_task: Optional[asyncio.Task] = None
@@ -371,6 +378,9 @@ class OneBot11Adapter(BasePlatformAdapter):
                 if sub_type == "connect":
                     self._bot_id = str(data.get("self_id", ""))
                     logger.info("OneBot v11: bot connected, self_id=%s", self._bot_id)
+                    # Send connect notification if configured
+                    if self._connect_notify_chat_ids:
+                        asyncio.create_task(self._send_connect_notify())
             return
 
         # Only handle message events
@@ -522,6 +532,28 @@ class OneBot11Adapter(BasePlatformAdapter):
                 logger.error("OneBot v11: message handler error: %s", e, exc_info=True)
 
     # ── Message sending ───────────────────────────────────────────────────
+
+    async def _send_connect_notify(self) -> None:
+        """Send a notification message to configured chat_ids when connected."""
+        try:
+            # Small delay to ensure the connection is fully ready
+            await asyncio.sleep(1)
+            for chat_id in self._connect_notify_chat_ids:
+                result = await self.send(
+                    chat_id=chat_id,
+                    content=f"OneBot v11 通道已连接 (bot_id={self._bot_id})",
+                )
+                if result.success:
+                    logger.info(
+                        "OneBot v11: connect notification sent to %s", chat_id
+                    )
+                else:
+                    logger.warning(
+                        "OneBot v11: connect notification to %s failed: %s",
+                        chat_id, result.error,
+                    )
+        except Exception as e:
+            logger.warning("OneBot v11: connect notification error: %s", e)
 
     async def send(
         self,
