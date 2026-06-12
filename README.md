@@ -41,6 +41,7 @@
 - 群白名单过滤（`group_allowed_chats`）
 - 群内仅响应 @ 机器人消息（`at_mention_only`）
 - 未授权私聊静默忽略（`silent_unauthorized_dm`）
+- 连接成功通知（`connect_notify`）
 - Cron 定时任务投递支持（含图片附件）
 
 ### 图片发送支持
@@ -141,6 +142,8 @@ platforms:
       at_mention_only: true
       allow_all_users: false
       silent_unauthorized_dm: true
+      connect_notify:
+        - "402156474"
 ```
 
 ### 配置说明
@@ -155,6 +158,7 @@ platforms:
 | `ONEBOT11_GROUP_ALLOWED_CHATS` | `group_allowed_chats` | 允许进入 gateway 的群号列表（逗号分隔 / YAML 列表） |
 | `ONEBOT11_AT_MENTION_ONLY` | `at_mention_only` | 群内是否仅处理 @ 机器人的消息 |
 | `ONEBOT11_SILENT_UNAUTHORIZED_DM` | `silent_unauthorized_dm` | 是否静默忽略未授权用户的私聊（不触发配对流程） |
+| `ONEBOT11_CONNECT_NOTIFY` | `connect_notify` | 连接成功后通知的 chat_id 列表（逗号分隔 / YAML 列表），每个 ID 收到一条私聊消息 |
 
 ### 群消息过滤顺序
 
@@ -169,6 +173,27 @@ platforms:
 - 白名单外的群消息不会进入 gateway，也不会进入 session
 - 白名单群里未 @ 机器人的消息也不会进入 gateway
 - 发送功能不受上述过滤影响，仍可正常向群里回消息
+
+### 连接成功通知
+
+配置 `connect_notify` 后，OneBot v11 通道连接成功（收到 `lifecycle/connect` 事件）时，会自动向列表中的每个 chat_id 发送一条私聊通知，内容格式为 `OneBot v11 通道已连接 (bot_id=xxx)`。
+
+```yaml
+platforms:
+  onebot11:
+    extra:
+      connect_notify:
+        - "402156474"
+        - "123456789"
+```
+
+环境变量方式（逗号分隔）：
+
+```env
+ONEBOT11_CONNECT_NOTIFY=402156474,123456789
+```
+
+通知在后台异步发送，有 1 秒延迟确保连接完全就绪，不阻塞其他平台连接。未配置或列表为空时不发送任何通知。
 
 ## OneBot 服务器配置
 
