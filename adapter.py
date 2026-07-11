@@ -278,8 +278,12 @@ class OneBot11Adapter(BasePlatformAdapter):
 
     # ── Connection lifecycle ──────────────────────────────────────────────
 
-    async def connect(self) -> bool:
-        """Connect to the OneBot v11 server via WebSocket."""
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        """Connect to the OneBot v11 server via WebSocket.
+
+        ``is_reconnect`` is part of Hermes' platform adapter contract. OneBot
+        has no server-side update queue to preserve, so the flag is ignored.
+        """
         if not WEBSOCKETS_AVAILABLE:
             logger.error("OneBot v11: websockets not installed. Run: pip install websockets")
             self._set_fatal_error(
