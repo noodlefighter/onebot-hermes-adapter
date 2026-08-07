@@ -144,6 +144,11 @@ platforms:
       silent_unauthorized_dm: true
       connect_notify:
         - "402156474"
+      # 单条 record 语音在 Gateway 媒体缓存中的最大大小（20 MiB）。
+      voice_media_max_bytes: 20971520
+      # 将 NapCat 容器内 get_record 返回的路径映射到 Gateway 主机路径。
+      record_path_map:
+        - "/app/.config/QQ=/srv/napcat-data"
 ```
 
 ### 配置说明
@@ -159,6 +164,45 @@ platforms:
 | `ONEBOT11_AT_MENTION_ONLY` | `at_mention_only` | 群内是否仅处理 @ 机器人的消息 |
 | `ONEBOT11_SILENT_UNAUTHORIZED_DM` | `silent_unauthorized_dm` | 是否静默忽略未授权用户的私聊（不触发配对流程） |
 | `ONEBOT11_CONNECT_NOTIFY` | `connect_notify` | 连接成功后通知的 chat_id 列表（逗号分隔 / YAML 列表），每个 ID 收到一条私聊消息 |
+| - | `voice_media_max_bytes` | 单条 `record` 语音写入 Gateway 媒体缓存的最大字节数，默认 20 MiB |
+| - | `record_path_map` | 将 OneBot 容器内 `get_record` 返回的绝对路径映射到 Gateway 主机路径；值为 `容器路径=主机路径` 的字符串或列表 |
+
+### 语音转写
+
+OneBot adapter 不执行 STT，也不配置或调用本地转写命令。收到 OneBot `record` 段后，适配器会取得语音媒体（优先使用段中的 `url`；只有 `file` 时调用 OneBot `get_record` 请求 WAV），并将它缓存到 `MessageEvent` 的 `VOICE`、`media_urls` 和 `media_types` 字段。Gateway 随后依据全局 `stt.provider` 选择并调用统一的 STT provider。
+
+当 NapCat 在 Docker 容器中运行，`get_record` 可能返回容器内的文件路径，Gateway 主机无法直接读取。请将 NapCat 的语音目录作为卷挂载到 Gateway 主机，并通过 `record_path_map` 将两端的绝对路径对应起来。例如 NapCat 容器中的 `/app/.config/QQ` 挂载到主机的 `/srv/napcat-data` 时：
+
+```yaml
+platforms:
+  onebot11:
+    extra:
+      record_path_map:
+        - "/app/.config/QQ=/srv/napcat-data"
+```
+
+可配置多个映射；路径必须都是绝对路径。映射重叠时，适配器优先使用容器路径前缀最长的一项。
+
+例如，当前使用 FunASR command provider 时，在 Gateway 的 `~/.hermes/config.yaml` 中配置：
+
+```yaml
+stt:
+  enabled: true
+  provider: funasr
+  providers:
+    funasr:
+      type: command
+      command: "/path/to/funasr-wrapper --input {input_path} --output {output_path} --language {language}"
+      format: txt
+      language: zh
+      timeout: 300
+```
+
+确保 FunASR 所需的模型目录已经存在于 Gateway 主机上；凭据应通过受控的环境变量或凭据管理方式提供，不要写入 `config.yaml`。保存配置后重启 Gateway，并发送一条真实的 OneBot `record` 语音消息验证完整转写链路：
+
+```bash
+hermes gateway restart
+```
 
 ### 群消息过滤顺序
 

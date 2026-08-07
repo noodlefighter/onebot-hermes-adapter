@@ -18,6 +18,11 @@ Configuration in config.yaml::
             allow_all_users: false
             allow_all_in_group: false
             silent_unauthorized_dm: false
+            # Maximum record-media size retained in the Gateway cache.
+            voice_media_max_bytes: 20971520
+            # Map record paths returned by a container to paths on this host.
+            record_path_map:
+              - "/container/path=/host/path"
 
 Or via environment variables (overrides config.yaml):
     ONEBOT11_WS_URL, ONEBOT11_ACCESS_TOKEN, ONEBOT11_ALLOWED_USERS,
@@ -29,10 +34,12 @@ import asyncio
 import base64
 import json
 import logging
+import mimetypes
 import os
+import stat
 import uuid
 from typing import Any, Dict, List, Optional
-from urllib.parse import unquote as _unquote
+from urllib.parse import unquote as _unquote, urlparse as _urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +51,8 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
     MessageEvent,
+    MessageType,
+    cache_audio_from_bytes,
     cache_image_from_bytes,
 )
 from gateway.session import SessionSource
@@ -102,6 +111,55 @@ def _parse_bool(value: Any, default: bool = False) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _parse_positive_number(value: Any, default: float) -> float:
+    """Return a positive numeric config value, falling back to ``default``."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _parse_record_path_map(value: Any) -> list[tuple[str, str]]:
+    """Parse ``container_path=host_path`` record-path mappings from config."""
+    if isinstance(value, str):
+        entries = [value]
+    elif isinstance(value, (list, tuple)):
+        entries = value
+    else:
+        return []
+
+    mappings = []
+    for entry in entries:
+        if not isinstance(entry, str):
+            logger.warning("OneBot v11: ignoring non-string record_path_map entry")
+            continue
+        container_path, separator, host_path = entry.partition("=")
+        container_path = container_path.strip()
+        host_path = host_path.strip()
+        if not separator or not container_path or not host_path:
+            logger.warning("OneBot v11: ignoring invalid record_path_map entry")
+            continue
+        if not os.path.isabs(container_path) or not os.path.isabs(host_path):
+            logger.warning("OneBot v11: record_path_map paths must be absolute")
+            continue
+        mappings.append((os.path.normpath(container_path), os.path.normpath(host_path)))
+
+    # The most-specific container prefix must win when mappings overlap.
+    return sorted(mappings, key=lambda mapping: len(mapping[0]), reverse=True)
+
+
+def _safe_voice_source_for_log(source: str) -> str:
+    """Return a source description that cannot expose URL credentials or query secrets."""
+    parsed = _urlparse(source)
+    if not parsed.scheme:
+        return source
+    netloc = parsed.netloc
+    if "@" in netloc:
+        netloc = f"***@{netloc.rsplit('@', 1)[1]}"
+    return f"{parsed.scheme}://{netloc}{parsed.path}"
+
+
 def _build_text_message(text: str) -> list:
     """Build OneBot v11 message segments from plain text."""
     return [{"type": "text", "data": {"text": text}}]
@@ -135,6 +193,99 @@ def _extract_images(segments: list) -> list:
             if img_info:
                 images.append(img_info)
     return images
+
+
+def _extract_records(segments: list) -> list:
+    """Extract OneBot v11 ``record`` segments, preserving their URL and file.
+
+    OneBot implementations differ: some include a directly downloadable
+    ``url``, while others only provide a ``file`` identifier for ``get_record``.
+    Keeping both lets the caller prefer the URL without losing the API fallback.
+    """
+    records = []
+    for seg in segments:
+        if not isinstance(seg, dict) or seg.get("type") != "record":
+            continue
+        data = seg.get("data", {})
+        if not isinstance(data, dict):
+            continue
+        record = {key: data[key] for key in ("url", "file") if data.get(key)}
+        if record:
+            records.append(record)
+    return records
+
+
+_AUDIO_MIME_BY_EXT = {
+    ".aac": "audio/aac",
+    ".amr": "audio/amr",
+    ".flac": "audio/flac",
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/opus",
+    ".silk": "audio/silk",
+    ".wav": "audio/wav",
+    ".webm": "audio/webm",
+    ".wma": "audio/x-ms-wma",
+}
+
+
+def _audio_magic_extension(data: bytes) -> Optional[str]:
+    """Return a precise audio extension for commonly seen OneBot payloads."""
+    if data.startswith(b"#!AMR"):
+        return ".amr"
+    if data.startswith(b"\x02#!SILK_V3") or data.startswith(b"#!SILK_V3"):
+        return ".silk"
+    if data.startswith(b"OggS"):
+        return ".opus" if b"OpusHead" in data[:128] else ".ogg"
+    if data.startswith(b"fLaC"):
+        return ".flac"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return ".wav"
+    if data.startswith(b"ID3"):
+        return ".mp3"
+    if len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0:
+        return ".aac" if (data[1] & 0xF6) == 0xF0 else ".mp3"
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return ".m4a"
+    if data.startswith(b"\x1a\x45\xdf\xa3"):
+        return ".webm"
+    return None
+
+
+def _extension_from_source(source: str) -> Optional[str]:
+    """Get an audio-looking extension from a URL or local file name."""
+    parsed = _urlparse(source)
+    path = parsed.path if parsed.scheme else source
+    ext = os.path.splitext(path)[1].lower()
+    return ext if ext in _AUDIO_MIME_BY_EXT else None
+
+
+def _audio_details(
+    data: bytes,
+    *,
+    source: str = "",
+    content_type: str = "",
+    requested_wav: bool = False,
+) -> tuple[str, str]:
+    """Choose cache extension and MIME without relabelling unknown audio WAV."""
+    content_mime = content_type.split(";", 1)[0].strip().lower()
+    magic_ext = _audio_magic_extension(data)
+    source_ext = _extension_from_source(source) if source else None
+    content_ext = mimetypes.guess_extension(content_mime) if content_mime.startswith("audio/") else None
+    if content_ext == ".oga":
+        content_ext = ".ogg"
+    if content_ext not in _AUDIO_MIME_BY_EXT:
+        content_ext = None
+
+    ext = magic_ext or content_ext or source_ext or (".wav" if requested_wav else ".audio")
+    mime = (
+        _AUDIO_MIME_BY_EXT.get(magic_ext or "")
+        or (content_mime if content_mime.startswith("audio/") else "")
+        or _AUDIO_MIME_BY_EXT.get(ext)
+        or "audio/unknown"
+    )
+    return ext, mime
 
 
 def _build_image_message(file: str) -> list:
@@ -263,14 +414,208 @@ class OneBot11Adapter(BasePlatformAdapter):
             or extra.get("connect_notify", [])
         )
 
+        # Records are cached for Gateway's media pipeline, not transcribed by
+        # this adapter.  ``max_bytes`` remains a compatibility spelling for
+        # deployments which share one media-size cap across segment types.
+        self.voice_media_max_bytes = int(_parse_positive_number(
+            extra.get(
+                "voice_media_max_bytes",
+                extra.get("media_max_bytes", extra.get("max_bytes")),
+            ),
+            20 * 1024 * 1024,
+        ))
+        self.record_path_map = _parse_record_path_map(extra.get("record_path_map"))
+
         # Runtime state
         self._ws: Any = None
         self._recv_task: Optional[asyncio.Task] = None
+        self._event_tasks: set[asyncio.Task] = set()
         self._bot_id: Optional[str] = None
         self._connected = False
         # Pending API call futures, keyed by echo value
         self._pending_api_calls: Dict[str, asyncio.Future] = {}
         self._chat_type_cache: Dict[str, str] = {}
+
+    def _validate_voice_bytes(self, data: bytes) -> None:
+        """Reject empty or oversized media before it reaches the Gateway cache."""
+        if not data:
+            raise ValueError("voice record is empty")
+        if len(data) > self.voice_media_max_bytes:
+            raise ValueError(
+                f"voice record exceeds {self.voice_media_max_bytes} byte limit"
+            )
+
+    def _map_record_path(self, source_path: str) -> str:
+        """Map a container record path to the host path using the longest prefix."""
+        normalized_source = os.path.normpath(source_path)
+        for container_path, host_path in self.record_path_map:
+            try:
+                relative_path = os.path.relpath(normalized_source, container_path)
+            except ValueError:
+                continue
+            if relative_path == os.pardir or relative_path.startswith(f"{os.pardir}{os.sep}"):
+                continue
+            mapped_path = (
+                host_path
+                if relative_path == os.curdir
+                else os.path.join(host_path, relative_path)
+            )
+            logger.info(
+                "OneBot v11: mapped get_record voice path: %s -> %s",
+                _safe_voice_source_for_log(source_path),
+                _safe_voice_source_for_log(mapped_path),
+            )
+            return mapped_path
+        return normalized_source
+
+    @staticmethod
+    def _validate_regular_voice_file(source_path: str, source: str) -> None:
+        """Allow only existing, non-symlink regular files as local records."""
+        try:
+            file_stat = os.lstat(source_path)
+        except OSError as exc:
+            raise ValueError(
+                "voice source is not a readable regular file: "
+                f"{_safe_voice_source_for_log(source)}"
+            ) from exc
+        if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError(
+                "voice source is not a readable regular file: "
+                f"{_safe_voice_source_for_log(source)}"
+            )
+
+    def _read_voice_file(self, source: str) -> bytes:
+        """Read a bounded local record into memory for persistent caching."""
+        self._validate_regular_voice_file(source, source)
+        if os.path.getsize(source) > self.voice_media_max_bytes:
+            raise ValueError(f"voice record exceeds {self.voice_media_max_bytes} byte limit")
+        with open(source, "rb") as audio_file:
+            data = audio_file.read(self.voice_media_max_bytes + 1)
+        self._validate_voice_bytes(data)
+        return data
+
+    def _download_voice_bytes(self, url: str) -> tuple[bytes, str]:
+        """Download a bounded record and retain only its bytes and content type."""
+        import urllib.request
+
+        request = urllib.request.Request(url, headers={"User-Agent": "HermesBot/1.0"})
+        received = 0
+        chunks = []
+        with urllib.request.urlopen(request, timeout=30) as response:
+            content_type = response.headers.get("Content-Type", "")
+            content_length = response.headers.get("Content-Length")
+            try:
+                if content_length and int(content_length) > self.voice_media_max_bytes:
+                    raise ValueError(
+                        f"voice record exceeds {self.voice_media_max_bytes} byte limit"
+                    )
+            except ValueError:
+                if content_length and not content_length.isdigit():
+                    logger.debug("OneBot v11: invalid voice Content-Length: %r", content_length)
+                else:
+                    raise
+            while chunk := response.read(64 * 1024):
+                received += len(chunk)
+                if received > self.voice_media_max_bytes:
+                    raise ValueError(
+                        f"voice record exceeds {self.voice_media_max_bytes} byte limit"
+                    )
+                chunks.append(chunk)
+        data = b"".join(chunks)
+        self._validate_voice_bytes(data)
+        return data, content_type
+
+    async def _read_voice_source(self, source: str) -> tuple[bytes, str]:
+        """Load an HTTP(S) or local-file record as bytes, without temp files."""
+        if source.startswith(("http://", "https://")):
+            return await asyncio.to_thread(self._download_voice_bytes, source)
+        if source.startswith("file://"):
+            parsed_source = _urlparse(source)
+            if parsed_source.netloc not in ("", "localhost"):
+                raise ValueError(
+                    "voice source is not a readable local file: "
+                    f"{_safe_voice_source_for_log(source)}"
+                )
+            source_path = _unquote(parsed_source.path)
+        else:
+            source_path = source
+        source_path = self._map_record_path(source_path)
+        self._validate_regular_voice_file(source_path, source)
+        return await asyncio.to_thread(self._read_voice_file, source_path), ""
+
+    @staticmethod
+    def _record_response_bytes(value: Any) -> Optional[bytes]:
+        """Decode byte values returned by OneBot implementations, if any."""
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return bytes(value)
+        if isinstance(value, str):
+            encoded = value
+            if value.startswith("base64://"):
+                encoded = value[len("base64://"):]
+            elif value.startswith("data:") and ";base64," in value:
+                encoded = value.split(";base64,", 1)[1]
+            else:
+                return None
+            return base64.b64decode(encoded, validate=True)
+        return None
+
+    async def _get_record_wav(self, file_value: Any) -> tuple[bytes, str, str]:
+        """Request a OneBot record as WAV and verify the returned bytes."""
+        response = await self._call_api(
+            "get_record", {"file": str(file_value), "out_format": "wav"}
+        )
+        if not isinstance(response, dict):
+            raise ValueError("get_record returned no record data")
+
+        # ``_call_api`` normally returns the OneBot response's ``data`` object,
+        # but accepting a nested data object also supports direct API stubs.
+        payload = response.get("data") if isinstance(response.get("data"), dict) else response
+        data = self._record_response_bytes(payload.get("bytes") or payload.get("data"))
+        source = ""
+        content_type = ""
+        if data is None:
+            source = str(payload.get("url") or payload.get("file") or "")
+            if not source:
+                raise ValueError("get_record returned neither file, url, nor bytes")
+            data, content_type = await self._read_voice_source(source)
+
+        self._validate_voice_bytes(data)
+        if _audio_magic_extension(data) != ".wav":
+            raise ValueError("get_record WAV conversion did not return WAV data")
+        return data, source, content_type
+
+    async def _cache_record(self, record: Dict[str, Any]) -> Optional[tuple[str, str]]:
+        """Resolve a OneBot record and cache it for Gateway STT providers."""
+        source = str(record.get("url") or "")
+        file_value = record.get("file")
+        content_type = ""
+        requested_wav = False
+        try:
+            if source:
+                data, content_type = await self._read_voice_source(source)
+                if _audio_magic_extension(data) == ".amr":
+                    if not file_value:
+                        raise ValueError(
+                            "downloaded URL record is AMR but no file is available for WAV conversion"
+                        )
+                    data, source, content_type = await self._get_record_wav(file_value)
+                    requested_wav = True
+            else:
+                if not file_value:
+                    raise ValueError("record segment has neither url nor file")
+                data, source, content_type = await self._get_record_wav(file_value)
+                requested_wav = True
+
+            ext, mime = _audio_details(
+                data,
+                source=source,
+                content_type=content_type,
+                requested_wav=requested_wav,
+            )
+            return cache_audio_from_bytes(data, ext), mime
+        except Exception as exc:
+            logger.warning("OneBot v11: failed to cache voice record: %s", exc)
+            return None
 
     @property
     def name(self) -> str:
@@ -336,6 +681,17 @@ class OneBot11Adapter(BasePlatformAdapter):
                 await self._recv_task
             except asyncio.CancelledError:
                 pass
+        self._recv_task = None
+
+        # Event handlers run separately so an event's API request cannot
+        # block the receive loop from consuming its echo response.  They must
+        # be cancelled before disconnecting to avoid orphaned work.
+        event_tasks = list(self._event_tasks)
+        for task in event_tasks:
+            task.cancel()
+        if event_tasks:
+            await asyncio.gather(*event_tasks, return_exceptions=True)
+
         if self._ws:
             try:
                 await self._ws.close()
@@ -359,7 +715,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                         if not fut.done():
                             fut.set_result(data)
                         continue
-                    await self._handle_event(data)
+                    self._schedule_event(data)
                 except json.JSONDecodeError:
                     logger.warning("OneBot v11: received non-JSON message")
                 except Exception as e:
@@ -369,6 +725,23 @@ class OneBot11Adapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("OneBot v11: receive loop ended: %s", e)
             self._connected = False
+
+    def _schedule_event(self, data: dict) -> None:
+        """Schedule an event handler without blocking API echo dispatch."""
+        task = asyncio.create_task(self._handle_event(data))
+        self._event_tasks.add(task)
+        task.add_done_callback(self._event_tasks.discard)
+        task.add_done_callback(self._log_event_task_result)
+
+    @staticmethod
+    def _log_event_task_result(task: asyncio.Task) -> None:
+        """Consume and log background event-handler failures."""
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error("OneBot v11: error handling event: %s", e, exc_info=True)
 
     async def _handle_event(self, data: dict) -> None:
         """Handle a single OneBot v11 event."""
@@ -431,11 +804,14 @@ class OneBot11Adapter(BasePlatformAdapter):
         # messages correctly even when gateway only passes a raw numeric ID.
         self._chat_type_cache[chat_id] = chat_type
 
-        # Extract text content
-        images = []
+        # Extract text and defer all media I/O until the access checks below.
+        media_segments = []
         if isinstance(message, list):
             text = _extract_text(message)
-            images = _extract_images(message)
+            media_segments = [
+                segment for segment in message
+                if isinstance(segment, dict) and segment.get("type") in {"image", "record"}
+            ]
             # Check if bot is mentioned in group
             is_mention = _is_at_bot(message, self._bot_id) if self._bot_id else False
         elif isinstance(message, str):
@@ -449,11 +825,63 @@ class OneBot11Adapter(BasePlatformAdapter):
             logger.info("OneBot v11: ignoring non-mention group message %s", chat_id)
             return
 
-        if not text and not images:
-            return
+        media_urls = []
+        media_types = []
+        has_cached_voice = False
+        for segment in media_segments:
+            if segment.get("type") == "record":
+                record_data = segment.get("data", {})
+                record = record_data if isinstance(record_data, dict) else {}
+                cached_record = await self._cache_record(record)
+                if cached_record:
+                    cached_path, audio_mime = cached_record
+                    media_urls.append(cached_path)
+                    media_types.append(audio_mime)
+                    has_cached_voice = True
+                continue
 
-        # Build session key
-        session_key = f"onebot11:{chat_type}:{chat_id}"
+            # Image processing remains the existing Gateway vision cache path.
+            image_data = segment.get("data", {})
+            image = image_data if isinstance(image_data, dict) else {}
+            url = str(image.get("url") or image.get("file") or "")
+            if not url:
+                continue
+            try:
+                if url.startswith("file://"):
+                    local_path = _unquote(url[7:])
+                    if os.path.exists(local_path):
+                        media_urls.append(local_path)
+                        ext = os.path.splitext(local_path)[1].lower() or ".jpg"
+                        media_types.append(f"image/{ext.lstrip('.')}")
+                elif url.startswith(("http://", "https://")):
+                    import urllib.request
+
+                    def _download_image():
+                        req = urllib.request.Request(url, headers={"User-Agent": "HermesBot/1.0"})
+                        with urllib.request.urlopen(req, timeout=30) as response:
+                            return response.read(), response.headers.get("Content-Type", "")
+
+                    img_bytes, content_type = await asyncio.to_thread(_download_image)
+                    ext = ".jpg"
+                    if "png" in content_type:
+                        ext = ".png"
+                    elif "webp" in content_type:
+                        ext = ".webp"
+                    elif "gif" in content_type:
+                        ext = ".gif"
+                    media_urls.append(cache_image_from_bytes(img_bytes, ext))
+                    media_types.append(f"image/{ext.lstrip('.')}")
+                    logger.info("OneBot v11: cached image from URL: %s", url[:80])
+                else:
+                    logger.debug("OneBot v11: skipping non-URL image: %s", url[:50])
+            except Exception as exc:
+                logger.warning("OneBot v11: failed to process image: %s", exc)
+
+        # Failed records are intentionally omitted, but accompanying text or
+        # images still dispatch.  A successfully cached voice note also
+        # dispatches when it is the sole message content.
+        if not text and not media_urls:
+            return
 
         # Create source metadata
         source = SessionSource(
@@ -467,54 +895,13 @@ class OneBot11Adapter(BasePlatformAdapter):
         # Create message event
         event = MessageEvent(
             text=text,
+            message_type=MessageType.VOICE if has_cached_voice else MessageType.TEXT,
             source=source,
             message_id=message_id,
         )
-
-        # Process images - download and cache locally for vision tool
-        if images:
-            media_urls = []
-            media_types = []
-            for img in images:
-                url = img.get("url", "")
-                if not url:
-                    continue
-                try:
-                    if url.startswith("file://"):
-                        # Local file - use directly
-                        local_path = url[7:]
-                        if os.path.exists(local_path):
-                            media_urls.append(local_path)
-                            ext = os.path.splitext(local_path)[1].lower() or ".jpg"
-                            media_types.append(f"image/{ext.lstrip('.')}")
-                    elif url.startswith("http://") or url.startswith("https://"):
-                        # Remote URL - download and cache using stdlib
-                        import urllib.request
-                        def _download_image():
-                            req = urllib.request.Request(url, headers={"User-Agent": "HermesBot/1.0"})
-                            with urllib.request.urlopen(req, timeout=30) as resp:
-                                return resp.read(), resp.headers.get("Content-Type", "")
-                        img_bytes, ct = await asyncio.to_thread(_download_image)
-                        ext = ".jpg"
-                        if "png" in ct:
-                            ext = ".png"
-                        elif "webp" in ct:
-                            ext = ".webp"
-                        elif "gif" in ct:
-                            ext = ".gif"
-                        cached = cache_image_from_bytes(img_bytes, ext)
-                        media_urls.append(cached)
-                        media_types.append(f"image/{ext.lstrip('.')}")
-                        logger.info("OneBot v11: cached image from URL: %s", url[:80])
-                    else:
-                        # Could be base64 or other format - skip for now
-                        logger.debug("OneBot v11: skipping non-URL image: %s", url[:50])
-                except Exception as e:
-                    logger.warning("OneBot v11: failed to process image: %s", e)
-
-            if media_urls:
-                event.media_urls = media_urls
-                event.media_types = media_types
+        if media_urls:
+            event.media_urls = media_urls
+            event.media_types = media_types
 
         # Store OneBot-specific metadata for send operations
         event._onebot_chat_type = chat_type
