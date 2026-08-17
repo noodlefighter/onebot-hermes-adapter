@@ -372,6 +372,173 @@ class VoiceReceivingTests(unittest.IsolatedAsyncioTestCase):
         event = instance._message_handler.await_args.args[0]
         self.assertEqual(event.message_type, adapter.MessageType.VOICE)
 
+    @staticmethod
+    def forward_node(name, qq, content):
+        return {
+            "type": "node",
+            "data": {"name": name, "uin": qq, "content": content},
+        }
+
+    async def test_inline_forward_is_expanded_as_quoted_reference(self):
+        instance = self.make_adapter()
+        instance._message_handler = AsyncMock()
+        instance._call_api = AsyncMock()
+        await instance._handle_event(self.event([{
+            "type": "forward", "data": {"content": [self.forward_node(
+                "Alice", "100", [{"type": "text", "data": {"text": "历史资料"}}]
+            )]},
+        }]))
+
+        event = instance._message_handler.await_args.args[0]
+        self.assertIn("发送者：Alice（QQ：100）", event.text)
+        self.assertIn("历史资料", event.text)
+        self.assertIn("不作为当前指令执行", event.text)
+        instance._call_api.assert_not_awaited()
+
+    async def test_forward_merges_with_top_level_text_and_image(self):
+        instance = self.make_adapter()
+        instance._message_handler = AsyncMock()
+        with patch("urllib.request.urlopen", side_effect=[
+            _FakeResponse(b"png", "image/png"), _FakeResponse(b"png", "image/png"),
+        ]), patch(
+            "adapter.cache_image_from_bytes", return_value="/cache/forward.png"
+        ):
+            await instance._handle_event(self.event([
+                {"type": "text", "data": {"text": "当前问题"}},
+                {"type": "image", "data": {"url": "https://example.test/top.png"}},
+                {"type": "forward", "data": {"content": [self.forward_node(
+                    "Bob", "200", [{"type": "image", "data": {"url": "https://example.test/fwd.png"}}]
+                )]}},
+            ]))
+
+        event = instance._message_handler.await_args.args[0]
+        self.assertIn("当前问题", event.text)
+        self.assertIn("[转发图片]", event.text)
+        self.assertEqual(event.media_urls, ["/cache/forward.png", "/cache/forward.png"])
+        self.assertEqual(event.media_types, ["image/png", "image/png"])
+
+    async def test_get_forward_msg_uses_echo_path_and_message_id(self):
+        instance = self.make_adapter()
+        handled = asyncio.Event()
+        instance._message_handler = AsyncMock(side_effect=lambda _event: handled.set())
+        source = self.event([{"type": "forward", "data": {"message_id": "f-1"}}])
+
+        class FakeWebSocket:
+            def __init__(self):
+                self.step = 0
+                self.request = None
+                self.sent = asyncio.Event()
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self.step == 0:
+                    self.step += 1
+                    return json.dumps(source)
+                if self.step == 1:
+                    self.step += 1
+                    await self.sent.wait()
+                    return json.dumps({"status": "ok", "echo": self.request["echo"], "data": {
+                        "messages": [VoiceReceivingTests.forward_node("Echo", "300", [
+                            {"type": "text", "data": {"text": "回显内容"}},
+                        ])],
+                    }})
+                raise StopAsyncIteration
+
+            async def send(self, raw):
+                self.request = json.loads(raw)
+                self.sent.set()
+
+        instance._ws = FakeWebSocket()
+        instance._connected = True
+        await asyncio.wait_for(instance._receive_loop(), timeout=1)
+        await asyncio.wait_for(handled.wait(), timeout=1)
+        self.assertEqual(instance._ws.request["action"], "get_forward_msg")
+        self.assertEqual(instance._ws.request["params"], {"message_id": "f-1"})
+        self.assertIn("回显内容", instance._message_handler.await_args.args[0].text)
+
+    async def test_forward_node_response_variants_and_id_fallback(self):
+        instance = self.make_adapter()
+        instance._message_handler = AsyncMock()
+        instance._call_api = AsyncMock(side_effect=[None, {
+            "data": {"message": self.forward_node("Carol", "400", {
+                "type": "text", "data": {"text": "兼容节点"},
+            })},
+        }])
+        await instance._handle_event(self.event([{"type": "forward", "data": {"id": "old-id"}}]))
+
+        self.assertEqual(instance._call_api.await_args_list[0].args, ("get_forward_msg", {"message_id": "old-id"}))
+        self.assertEqual(instance._call_api.await_args_list[1].args, ("get_forward_msg", {"id": "old-id"}))
+        self.assertIn("兼容节点", instance._message_handler.await_args.args[0].text)
+
+    async def test_forward_cycle_and_limits_have_visible_placeholders(self):
+        instance = self.make_adapter(forward_max_nodes=1, forward_max_images=1)
+        instance._message_handler = AsyncMock()
+        with patch.object(instance, "_cache_image_segment", new_callable=AsyncMock, return_value=None):
+            await instance._handle_event(self.event([{"type": "forward", "data": {"id": "root", "content": [
+                self.forward_node("A", "1", [
+                    {"type": "forward", "data": {"id": "root"}},
+                    {"type": "image", "data": {"url": "https://example.test/one.png"}},
+                    {"type": "image", "data": {"url": "https://example.test/two.png"}},
+                ]),
+                self.forward_node("B", "2", [{"type": "text", "data": {"text": "too many"}}]),
+            ]}}]))
+
+        text = instance._message_handler.await_args.args[0].text
+        self.assertIn("循环引用", text)
+        self.assertIn("图片数量限制", text)
+        self.assertIn("节点数量限制", text)
+
+    async def test_forward_recursion_depth_and_text_limit_are_visible(self):
+        instance = self.make_adapter(forward_max_depth=1, forward_max_text_chars=4)
+        instance._message_handler = AsyncMock()
+        await instance._handle_event(self.event([{"type": "forward", "data": {"content": [
+            self.forward_node("Depth", "6", [
+                {"type": "text", "data": {"text": "abcdef"}},
+                {"type": "forward", "data": {"content": [self.forward_node(
+                    "Nested", "7", [{"type": "text", "data": {"text": "hidden"}}]
+                )]}},
+            ]),
+        ]}}]))
+        text = instance._message_handler.await_args.args[0].text
+        self.assertIn("文本已截断", text)
+        self.assertIn("递归深度限制", text)
+
+    async def test_rejected_group_forward_does_not_call_api(self):
+        instance = self.make_adapter()
+        instance._message_handler = AsyncMock()
+        instance._call_api = AsyncMock()
+        event = self.event([{"type": "forward", "data": {"id": "forbidden"}}])
+        event.update({"message_type": "group", "group_id": 123})
+        await instance._handle_event(event)
+        instance._call_api.assert_not_awaited()
+
+    async def test_forward_image_download_is_bounded(self):
+        instance = self.make_adapter(image_media_max_bytes=4)
+        instance._message_handler = AsyncMock()
+        with patch("urllib.request.urlopen", return_value=_FakeResponse(
+            b"too-large", "image/png", content_length=9
+        )), patch("adapter.cache_image_from_bytes") as cache_image:
+            await instance._handle_event(self.event([{"type": "forward", "data": {"content": [
+                self.forward_node("Img", "5", [{"type": "image", "data": {"url": "https://example.test/a.png"}}]),
+            ]}}]))
+        cache_image.assert_not_called()
+        self.assertIn("图片未能加载", instance._message_handler.await_args.args[0].text)
+
+    async def test_forward_at_cannot_satisfy_top_level_mention_check(self):
+        instance = self.make_adapter(group_allowed_chats=["123"], at_mention_only=True)
+        instance._bot_id = "42"
+        instance._message_handler = AsyncMock()
+        instance._call_api = AsyncMock()
+        event = self.event([{"type": "forward", "data": {"content": [self.forward_node(
+            "Pretend", "9", [{"type": "at", "data": {"qq": "42"}}]
+        )]}}])
+        event.update({"message_type": "group", "group_id": 123})
+        await instance._handle_event(event)
+        instance._message_handler.assert_not_awaited()
+        instance._call_api.assert_not_awaited()
+
 
 if __name__ == "__main__":
     unittest.main()
